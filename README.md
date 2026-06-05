@@ -8,9 +8,9 @@
 | 파일 | 역할 |
 |------|------|
 | `sales_anomaly_engine.py` | 통계 엔진(로더·OLS·이상치 탐지·진단). UI 의존성 없음 |
-| `report_business.py` | 결과물1 **보고용** xlsx(요약·일별현황·계수·그라데이션 밴드차트·이상일·SKU) |
-| `report_method.py` | 결과물2 **검토용** xlsx(코드/기법/수식·신뢰도·시그마민감도·자동 결론) |
-| `app.py` | **데이터 입력 화면**(Streamlit) |
+| `report_business.py` | **보고용** xlsx(요약·일별현황·계수·그라데이션 밴드차트·이상일·SKU + 시그마민감도·VIF·상관차분·잔차진단·신뢰도결론) |
+| `app.py` | **데이터 입력 화면**(Streamlit). 보고용 리포트 1종 다운로드 |
+| `분석방법_정리.html` | 코드·기법·수식·판정기준 정리(정적 참고문서, 데이터 무관) |
 
 ## 로컬 실행
 
@@ -32,12 +32,6 @@ python sales_anomaly_engine.py --synthetic --out report.xlsx
 python sales_anomaly_engine.py --sales 매출.xlsx --daily 일간.xlsx \
        --daily-sheet 0 --out report.xlsx
 ```
-
-## 무료 배포(GitHub + Streamlit Community Cloud)
-
-1. 이 4개 파일 + `requirements.txt`를 GitHub **공개** 저장소에 push.
-2. https://share.streamlit.io 접속 → GitHub 로그인 → 저장소 선택 → `app.py` 지정 → Deploy.
-3. 배포 후 URL로 누구나 접속해 xlsx 업로드/분석 가능(무료 티어).
 
 ## 관리한계 K 가이드
 
