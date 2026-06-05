@@ -11,22 +11,21 @@ app.py
 
 출력
 ----
-- 결과물1 보고용  : report_business.build_business_report
-- 결과물2 검토용  : report_method.build_method_report
+- 보고용 리포트(xlsx) : report_business.build_business_report
+  (일별현황·계수·밴드차트·이상일·SKU + 시그마민감도·VIF·상관차분·잔차진단·신뢰도결론 통합)
+- 코드/수식/기준 정리 : 분석방법_정리.html (정적 참고문서, 동봉)
 
 실행:  streamlit run app.py
 """
 from __future__ import annotations
 
-import os
-import tempfile
+import io
 
 import pandas as pd
 import streamlit as st
 
 import sales_anomaly_engine as E
 import report_business as RB
-import report_method as RM
 
 
 st.set_page_config(page_title="매출 이상치 탐지", layout="wide")
@@ -38,14 +37,6 @@ st.caption(f"대상: {E.TARGET_BRAND} {E.TARGET_PRODUCT_DAILY}  ·  "
 # ─────────────────────────────────────────────────────────────────────────
 # 보조
 # ─────────────────────────────────────────────────────────────────────────
-def _save_upload(uploaded) -> str:
-    """업로드(BytesIO)를 임시파일로 저장하고 경로 반환."""
-    fd, path = tempfile.mkstemp(suffix=".xlsx")
-    with os.fdopen(fd, "wb") as f:
-        f.write(uploaded.getbuffer())
-    return path
-
-
 def _sheet_arg(s: str):
     """시트 인자: 숫자면 인덱스(int), 아니면 시트명(str)."""
     s = (s or "").strip()
@@ -60,14 +51,12 @@ with st.sidebar:
     same_file = st.checkbox("매출_raw와 일간데이터가 같은 파일", value=False,
                             help="한 워크북에 두 시트가 모두 있으면 체크")
 
-    sales_path = daily_path = None
     up_sales = st.file_uploader("매출_raw 파일(.xlsx)", type=["xlsx"])
     up_daily = (up_sales if same_file
                 else st.file_uploader("일간데이터 파일(.xlsx)", type=["xlsx"]))
-    if up_sales:
-        sales_path = _save_upload(up_sales)
-    if up_daily:
-        daily_path = sales_path if (same_file and sales_path) else _save_upload(up_daily)
+    sales_bytes = up_sales.getvalue() if up_sales else None
+    daily_bytes = (sales_bytes if (same_file and sales_bytes)
+                   else (up_daily.getvalue() if up_daily else None))
 
     st.header("2) 시트 이름")
     sales_sheet = st.text_input("매출_raw 시트", value="매출_raw")
@@ -80,28 +69,29 @@ with st.sidebar:
                "실제 검출 수는 데이터에 따라 다름 → 결과의 '시그마민감도' 시트 확인.")
 
     run = st.button("분석 실행", type="primary", use_container_width=True)
+    st.caption("🔒 업로드 데이터는 메모리에서만 처리되며 디스크/DB에 저장하거나 "
+               "외부로 전송하지 않습니다(분석 종료 시 사라짐).")
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 실행
+# 실행 (전 과정 메모리 처리 — 디스크 미저장)
 # ─────────────────────────────────────────────────────────────────────────
 if run:
     try:
-        if not (sales_path and daily_path):
+        if not (sales_bytes and daily_bytes):
             st.error("매출_raw와 일간데이터를 모두 입력하세요.")
             st.stop()
 
         with st.spinner("분석 중… (적합 → 이상치 탐지 → 진단)"):
             result = E.run_analysis(
-                sales_path, daily_path,
+                io.BytesIO(sales_bytes), io.BytesIO(daily_bytes),
                 sales_sheet=_sheet_arg(sales_sheet),
                 daily_sheet=_sheet_arg(daily_sheet),
                 sigma_k=sigma_k,
             )
-            biz_path = os.path.join(tempfile.gettempdir(), "보고용_리포트.xlsx")
-            mth_path = os.path.join(tempfile.gettempdir(), "검토용_리포트.xlsx")
-            RB.build_business_report(result, biz_path)
-            RM.build_method_report(result, mth_path)
+            biz_buf = io.BytesIO()
+            RB.build_business_report(result, biz_buf)
+            biz_data = biz_buf.getvalue()
 
         an = result["anomalies"]
         n_anom = int(an["이상치"].sum())
@@ -109,43 +99,34 @@ if run:
                    f"R²={result['ols'].rsquared:.3f} · σ={result['sigma']:.4f} · "
                    f"이상일 {n_anom}일 (±{sigma_k:.1f}σ)")
 
-        # ── 다운로드 ──
-        c1, c2 = st.columns(2)
-        with c1:
-            with open(biz_path, "rb") as f:
-                st.download_button("⬇ 결과물1 · 보고용 리포트(xlsx)", f.read(),
-                                   file_name="보고용_리포트.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
-        with c2:
-            with open(mth_path, "rb") as f:
-                st.download_button("⬇ 결과물2 · 검토용 리포트(xlsx)", f.read(),
-                                   file_name="검토용_리포트.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
+        # ── 다운로드(보고용 단일) ──
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        st.download_button("⬇ 보고용 리포트 다운로드 (xlsx)", biz_data,
+                           file_name="보고용_리포트.xlsx", mime=mime,
+                           use_container_width=True)
 
-        # ── 화면 미리보기 ──
+        # ── 화면 미리보기(보고용 버퍼에서 읽기) ──
         st.subheader("요약")
-        st.dataframe(
-            pd.read_excel(biz_path, sheet_name="00_요약"),
-            use_container_width=True, hide_index=True)
+        st.dataframe(pd.read_excel(io.BytesIO(biz_data), sheet_name="00_요약"),
+                     use_container_width=True, hide_index=True)
 
         col_a, col_b = st.columns(2)
         with col_a:
             st.subheader("K별 이상일 수 (K 선택 근거)")
-            ss = pd.read_excel(mth_path, sheet_name="03_시그마민감도")
+            ss = pd.read_excel(io.BytesIO(biz_data), sheet_name="07_시그마민감도")
             st.dataframe(ss.dropna(subset=["SIGMA_K"]) if "SIGMA_K" in ss.columns else ss,
                          use_container_width=True, hide_index=True)
         with col_b:
-            st.subheader("결론 및 유의점(자동)")
-            cc = pd.read_excel(mth_path, sheet_name="07_결론_및_유의점")
+            st.subheader("신뢰도 결론(자동)")
+            cc = pd.read_excel(io.BytesIO(biz_data), sheet_name="11_신뢰도_결론")
             st.dataframe(cc.dropna(subset=["점검항목"]) if "점검항목" in cc.columns else cc,
                          use_container_width=True, hide_index=True)
 
         st.subheader("이상일 요약")
-        st.dataframe(pd.read_excel(biz_path, sheet_name="04_이상일_요약"),
+        st.dataframe(pd.read_excel(io.BytesIO(biz_data), sheet_name="04_이상일_요약"),
                      use_container_width=True, hide_index=True)
-        st.info("시각화(그라데이션 밴드 차트)는 보고용 리포트의 '03_매출_밴드차트' 시트에서 확인하세요.")
+        st.info("그라데이션 밴드 차트는 보고용 리포트의 '03_매출_밴드차트' 시트, "
+                "코드·수식·기준 정리는 동봉 '분석방법_정리.html'에서 확인하세요.")
 
     except Exception as e:
         st.error(f"오류: {e}")
