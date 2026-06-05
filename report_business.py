@@ -177,13 +177,17 @@ def _anomaly_summary(result: dict) -> pd.DataFrame:
     m = anom.merge(contrib, on="날짜", how="left")
 
     # 활동/이슈: 이상치표에 없는 활동열만 model_frame에서 보강
+    # (요청 반영) 마케팅 조회수 제외 / 숏폼 조회수 + 기획사이다 조회수(AB열) 표시
     mf = result["model_frame"]
     base_issue = [c for c in ["행사명", "광고비"] if c in m.columns]
-    extra_issue = [c for c in ["마케팅_조회수", "숏폼_조회수", "바이럴_1~3위건수"]
-                   if c in mf.columns and c not in m.columns]
-    if extra_issue:
-        m = m.merge(mf[["날짜"] + extra_issue], on="날짜", how="left")
-    issue_cols = base_issue + extra_issue
+    extra_src = [c for c in ["숏폼_조회수", "사이다_조회수"]
+                 if c in mf.columns and c not in m.columns]
+    if extra_src:
+        m = m.merge(mf[["날짜"] + extra_src], on="날짜", how="left")
+    # 가독성 위해 사이다_조회수 → 기획사이다_조회수로 표기
+    rename_issue = {"사이다_조회수": "기획사이다_조회수"}
+    m = m.rename(columns=rename_issue)
+    issue_cols = base_issue + [rename_issue.get(c, c) for c in extra_src]
 
     def _cause(r):
         devs = {t: float(r.get(f"기여_{t}", 0.0)) - means.get(t, 0.0) for t in means}
@@ -205,8 +209,131 @@ def _anomaly_summary(result: dict) -> pd.DataFrame:
     out = out.round({"매출": 0, "예측": 0, "이탈%": 1})
     out.attrs["note"] = ("주원인=그날 예측을 평소 대비 가장 크게 끌어올린 변수. "
                          "기여배수=그 변수가 예측을 평소 대비 몇 배로 만들었나(EXP). "
-                         "행사명/광고비/조회수는 그날 실제 마케팅 활동(이슈 확인용).")
+                         "행사명/광고비/숏폼조회수/기획사이다조회수는 그날 실제 활동(이슈 확인용). "
+                         "※ 조회수 활동열은 베이스라인 예측에 사용되지 않음(참고용). "
+                         "베이스라인 = 추세 + 요일 + 프로모션 + 광고비.")
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 신뢰도 자동 결론
+# ─────────────────────────────────────────────────────────────────────────
+def _get_val(df: pd.DataFrame, label_col: str, label: str, val_col: str):
+    """라벨 포함 행의 값(float)을 안전 반환. 없거나 비수치면 None."""
+    hit = df[df[label_col].astype(str).str.contains(label, regex=False, na=False)]
+    if hit.empty:
+        return None
+    try:
+        return float(hit.iloc[0][val_col])
+    except (TypeError, ValueError):
+        return None
+
+
+def _reliability_conclusions(result: dict) -> pd.DataFrame:
+    """신뢰도 낮음/모순(부호 충돌)/가정 위반을 규칙으로 자동 플래그."""
+    res = result["ols"]
+    rd = result["resid_diag"]
+    flags = []
+
+    def add(item, value, verdict, meaning, advice):
+        flags.append({"점검항목": item, "값": value, "판정": verdict,
+                      "의미": meaning, "권고": advice})
+
+    r2 = float(res.rsquared)
+    add("설명력 R²", round(r2, 3),
+        "참고" if r2 >= 0.5 else "주의(설명력 낮음)",
+        "베이스라인이 매출 변동의 일부만 설명. 단 이상치 판정은 '예측 대비 잔차'라 "
+        "R²가 낮아도 잔차진단이 양호하면 ±Kσ 판정 자체는 유효.",
+        "예측값 신뢰가 중요하면 변수 보강. 이상탐지 목적이면 잔차진단·시그마민감도로 정당성 확인.")
+
+    jb = _get_val(rd, "검정", "Jarque-Bera", "값")
+    if jb is not None:
+        add("잔차 정규성(JB p)", round(jb, 4),
+            "양호" if jb >= 0.05 else "주의",
+            "정규에 가까우면 ±Kσ의 '몇 %' 해석 성립. 벗어나면 정규기대 %는 부정확.",
+            "K는 시그마민감도의 '실제비율'을 보고 결정(정규기대 맹신 금지).")
+
+    dw = _get_val(rd, "검정", "Durbin-Watson", "값")
+    if dw is not None:
+        add("잔차 자기상관(DW)", round(dw, 3),
+            "양호" if 1.5 <= dw <= 2.5 else "주의",
+            "2 근처면 자기상관 없음. 벗어나면 시계열 의존 → σ·표준오차 과소평가 가능.",
+            "양호면 조치 불필요. 아니면 HAC 적용 확인 / 전일매출 항 재도입 검토.")
+
+    bp = _get_val(rd, "검정", "Breusch-Pagan", "값")
+    if bp is not None:
+        add("등분산성(BP p)", round(bp, 4),
+            "양호" if bp >= 0.05 else "주의",
+            "등분산이면 양호. 이분산이면 고매출일 과검출 위험(로그변환으로 완화 중).",
+            "양호면 조치 불필요. 아니면 잔차 vs 적합값 산점 확인.")
+
+    vif = result.get("vif")
+    if vif is not None and "VIF" in vif.columns and len(vif):
+        vser = pd.to_numeric(vif["VIF"], errors="coerce")
+        maxv = float(vser.max()); who = vif.iloc[vser.idxmax()]["변수"]
+        verdict = "경고(심각)" if maxv > 10 else ("주의" if maxv > 5 else "양호")
+        add(f"다중공선성 VIF(최대: {who})", round(maxv, 2), verdict,
+            "VIF 높은 변수는 계수 불안정(부호·크기 신뢰 저하). 기준: >5 주의 / >10 심각.",
+            "VIF>10이면 해당 변수 계수 해석 보류. 변수 통합/제거 검토.")
+
+    coef = result["coef"]
+    cr = result.get("correlations")
+    ad_coef = _get_val(coef, "변수", "광고비", "계수")
+    raw_corr = None
+    if cr is not None and "변수" in cr.columns and "매출_상관(원시)" in cr.columns:
+        hit = cr[cr["변수"] == "광고비"]
+        if not hit.empty:
+            try:
+                raw_corr = float(hit.iloc[0]["매출_상관(원시)"])
+            except (TypeError, ValueError):
+                raw_corr = None
+    if ad_coef is not None and raw_corr is not None:
+        contradiction = (ad_coef < 0 and raw_corr > 0)
+        add("광고비: 회귀계수 vs 원시상관",
+            f"계수 {ad_coef:.2e} / 원시상관 {raw_corr:+.2f}",
+            "경고(모순)" if contradiction else "참고",
+            ("통제후 회귀계수는 음수인데 원시상관은 양수 → 추세교란·역인과 가능. "
+             "'광고비가 매출을 올린다/내린다'로 단정 불가."
+             if contradiction else "회귀계수와 원시상관 부호가 모순되지 않음."),
+            "광고비 차분회귀(09 시트) 부호·유의로 재확인. 인과 확정은 소규모 축소실험 필요.")
+
+    ss = result.get("sigma_sens")
+    if ss is not None and "현재선택" in ss.columns:
+        cur = ss[ss["현재선택"].astype(str).str.contains("현재", na=False)]
+        if not cur.empty:
+            act = float(cur.iloc[0]["비율(%)"]); exp = float(cur.iloc[0]["정규기대(%)"])
+            verdict = "주의" if abs(act - exp) >= max(3.0, 0.5 * exp) else "양호"
+            add(f"이상치 실제비율 vs 정규기대(±{E.SIGMA_K:.2f}σ)",
+                f"실제 {act:.1f}% / 기대 {exp:.2f}%", verdict,
+                "비슷하면 ±Kσ 기준이 데이터에 부합. 크게 다르면 정규가정 부적합.",
+                "차이가 크면 정규기대% 대신 '실제비율'로 K를 정할 것.")
+
+    out = pd.DataFrame(flags)
+    out.attrs["note"] = ("규칙 기반 자동 진단. '경고'는 우선 확인, '주의'는 해석 시 유의, "
+                         "'참고/양호'는 통과. 인과(특히 광고비)는 실험 없이 단정하지 않음. "
+                         "코드·수식·기준 상세는 '분석방법_정리.html' 참고.")
+    return out
+
+
+def _corr_diff_block(xw, sheet: str, result: dict):
+    """상관·차분 관련 3표를 한 시트에 위아래로 기록."""
+    ws = xw.book.create_sheet(sheet)
+    r = 1
+    for title, key in [("[원시/추세제거 상관]", "correlations"),
+                       ("[변수효과 비교(수준/차분)]", "var_effect"),
+                       ("[광고비 차분회귀]", "ad_diff_reg")]:
+        df_ = result.get(key)
+        if df_ is None or len(df_) == 0:
+            continue
+        ws.cell(row=r, column=1, value=title).font = Font(bold=True, size=11)
+        r += 1
+        df_.to_excel(xw, sheet_name=sheet, index=False, startrow=r - 1)
+        r += len(df_) + 1
+        note = df_.attrs.get("note", "")
+        if note:
+            ws.cell(row=r, column=1, value="해설:")
+            ws.cell(row=r, column=2, value=note)
+            r += 2
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -235,8 +362,9 @@ def build_business_report(result: dict, out_path: str) -> str:
         ("  └ 하회(예측보다 낮음)", n_dn),
         ("핵심 메시지",
          f"전체 {int(an['날짜'].nunique())}일 중 {int(an['이상치'].sum())}일이 "
-         f"예측 ±{E.SIGMA_K:.2f}σ 밴드를 벗어남. 이상일별 원인·활동은 04 시트, "
-         f"시각화는 03 시트, 변수 영향은 02·06 시트 참고."),
+         f"예측 ±{E.SIGMA_K:.2f}σ 밴드를 벗어남. 이상일별 원인·활동은 04, 시각화는 03, "
+         f"변수 영향은 02·06. 신뢰도·모순 점검은 07~11(특히 11_신뢰도_결론). "
+         f"코드·수식·기준 상세는 동봉 '분석방법_정리.html'."),
     ], columns=["항목", "값"])
 
     # 01 일별 매출현황
@@ -292,9 +420,25 @@ def build_business_report(result: dict, out_path: str) -> str:
         sku.to_excel(xw, sheet_name="05_이상일_SKU분해", index=False)
         pred_decomp.to_excel(xw, sheet_name="06_일별_예측분해", index=False)
 
+        # ── 신뢰도 레이어(검토용에서 통합) ──
+        sigma_sens = result["sigma_sens"]
+        vif = result["vif"]
+        resid_diag = result["resid_diag"]
+        conclusions = _reliability_conclusions(result)
+
+        sigma_sens.to_excel(xw, sheet_name="07_시그마민감도", index=False)
+        vif.to_excel(xw, sheet_name="08_다중공선성_VIF", index=False)
+        _corr_diff_block(xw, "09_상관_차분_비교", result)
+        resid_diag.to_excel(xw, sheet_name="10_잔차진단", index=False)
+        conclusions.to_excel(xw, sheet_name="11_신뢰도_결론", index=False)
+
         # 시트별 노트(있으면 마지막 행 아래에 첨부)
         for sht, df_ in [("04_이상일_요약", anom_summary),
-                         ("06_일별_예측분해", pred_decomp)]:
+                         ("06_일별_예측분해", pred_decomp),
+                         ("07_시그마민감도", sigma_sens),
+                         ("08_다중공선성_VIF", vif),
+                         ("10_잔차진단", resid_diag),
+                         ("11_신뢰도_결론", conclusions)]:
             note = df_.attrs.get("note", "")
             if note:
                 ws = xw.sheets[sht]
@@ -306,7 +450,10 @@ def build_business_report(result: dict, out_path: str) -> str:
                           ("02_베이스라인_계수", coef.shape[1]),
                           ("04_이상일_요약", anom_summary.shape[1]),
                           ("05_이상일_SKU분해", sku.shape[1]),
-                          ("06_일별_예측분해", pred_decomp.shape[1])]:
+                          ("06_일별_예측분해", pred_decomp.shape[1]),
+                          ("07_시그마민감도", sigma_sens.shape[1]),
+                          ("08_다중공선성_VIF", vif.shape[1]),
+                          ("11_신뢰도_결론", conclusions.shape[1])]:
             if sht in xw.sheets and ncol > 0:
                 _style_header(xw.sheets[sht], ncol)
 
