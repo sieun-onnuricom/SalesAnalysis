@@ -257,7 +257,10 @@ def _anomaly_summary(P: dict, metric: str) -> pd.DataFrame:
                          "기여배수=그 변수가 예측을 평소 대비 몇 배로 만들었나(EXP). "
                          "행사명/광고비/숏폼조회수/기획사이다조회수는 그날 실제 활동(이슈 확인용). "
                          "※ 조회수 활동열은 베이스라인 예측에 사용되지 않음(참고용). "
-                         "베이스라인 = 추세 + 요일 + 프로모션 + 광고비.")
+                         "베이스라인 = 추세 + 요일 + 광고비"
+                         + ("" if E.PROMO_IN_BASELINE else
+                            "(프로모션은 회귀 통제용이며 베이스라인 제외 → 프로모션 날은 '상회'로 잡힘)")
+                         + ".")
     return out
 
 
@@ -468,8 +471,13 @@ def build_business_report(result: dict, out_path: str, primary: str = "수량") 
         ("주지표", f"판매수량 (매출은 12_매출_보조요약 참조)"),
         ("분석 기간", period),
         ("분석 일수", int(an["날짜"].nunique())),
-        ("모델", f"로그{metric} OLS · 추세 + 요일 + 프로모션 + 광고비"
+        ("모델", f"로그{metric} OLS · 추세 + 요일 + 광고비"
+                 + (" + 프로모션" if E.PROMO_IN_BASELINE else "")
                  + (" + 전일값" if E.USE_LAG1 else "")),
+        ("프로모션 처리",
+         ("베이스라인 포함" if E.PROMO_IN_BASELINE else
+          "회귀 통제용으로만 사용 · 베이스라인/밴드에서는 제외 → "
+          "프로모션 날은 베이스라인 위로 솟아 '상회' 이상일로 잡히고 행사명으로 표시")),
         ("설명력 R²", round(float(res.rsquared), 4)),
         (f"잔차 표준편차 σ(로그)", round(float(P["sigma"]), 4)),
         ("관리한계 배수 K", f"±{E.SIGMA_K:.2f}σ (낮을수록 이상치를 더 많이 잡음)"),
