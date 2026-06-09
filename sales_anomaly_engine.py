@@ -69,6 +69,14 @@ SPIKE_PCT = 30.0           # 예측이 전일 대비 ±이 %p 이상 튄 날을 
 USE_WEEKDAY_SIGMA = True   # ±Kσ 관리한계를 요일별 σ로 (요일별 변동성 차이 반영 -> 과검출 교정)
 WEEKDAY_SIGMA_MIN_N = 10   # 요일별 σ 산출 최소 표본(미만이면 전체 σ 대체)
 
+# 프로모션 처리: 회귀에는 포함(계수 추정·다른 변수 통제·σ 정제)하되,
+# 베이스라인 예측/밴드/이상치 판정에서는 기여를 제외한다.
+#  - 프로모션 스파이크로 베이스라인 밴드가 들쑥날쑥해지는 것 방지(매끈한 추세 밴드).
+#  - 프로모션 날은 자연히 '상회' 이상일로 잡히고, 이상일 요약에서 '프로모션/행사명'으로 표시됨.
+#  - 회귀에서 빼면 안 되는 이유: 프로모션(대형 스파이크)을 통제 안 하면 σ가 부풀고
+#    광고비 계수에 프로모션 효과가 흘러들어(누락변수편향) 계수가 왜곡됨.
+PROMO_IN_BASELINE = False
+
 # 유리젖병으로 분류할 SKU 코드(매출_raw D열). 접두 일치(LB160-1P, LB160_2P 등 변형 포함).
 # 제품명 문자열 추정 대신 이 목록으로 '확정'. 품목 추가 시 코드만 넣으면 됨.
 GLASS_BOTTLE_SKUS = ["LB160", "LB240"]
@@ -316,6 +324,16 @@ def _design_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list]:
     return X, list(X.columns)
 
 
+def _predict_design(df: pd.DataFrame) -> pd.DataFrame:
+    """예측/탐지용 설계행렬. PROMO_IN_BASELINE=False면 프로모션 기여를 0으로
+    (회귀계수는 _design_matrix로 적합·통제하되, 베이스라인/탐지에서는 프로모션 제외)."""
+    X, _ = _design_matrix(df)
+    if not PROMO_IN_BASELINE and "프로모션" in X.columns:
+        X = X.copy()
+        X["프로모션"] = 0.0
+    return X
+
+
 def _target(df: pd.DataFrame) -> np.ndarray:
     """적합 대상 y. 로그 옵션 시 logY, 아니면 매출(원)."""
     return df["logY"].values if USE_LOG_TARGET else df["매출"].astype(float).values
@@ -458,8 +476,8 @@ def detect_anomalies(res, sigma: float, df: pd.DataFrame, sigma_map: dict = None
                      ) -> pd.DataFrame:
     """예측 ±SIGMA_K·σ 이탈일 탐지. 로그모델이면 원단위로 역변환.
     sigma_map(요일별 σ) 주어지면 요일마다 다른 관리폭 적용."""
-    X, _ = _design_matrix(df)
-    pred_m = np.asarray(res.predict(X.astype(float)), dtype=float)  # 모델스케일 예측
+    X = _predict_design(df)                                       # 프로모션 제외(옵션) 예측행렬
+    pred_m = np.asarray(res.predict(X.astype(float)), dtype=float)  # 모델스케일 예측(베이스라인)
 
     # 요일별 σ 벡터(없으면 전체 σ)
     if sigma_map:
@@ -543,7 +561,7 @@ def residual_diagnostics(res, sigma: float) -> pd.DataFrame:
 def sigma_sensitivity(res, sigma: float, df: pd.DataFrame, sigma_map: dict = None
                       ) -> pd.DataFrame:
     """SIGMA_K 민감도: 관리한계 배수별 이상일 수. 2.0 근처에서 급변하면 기준 불안정."""
-    X, _ = _design_matrix(df)
+    X = _predict_design(df)
     pred_m = np.asarray(res.predict(X.astype(float)), dtype=float)
     ym = df["logY"].values if USE_LOG_TARGET else df["매출"].astype(float).values
     if sigma_map:
@@ -630,7 +648,9 @@ def decompose_prediction(res, sigma: float, df: pd.DataFrame
     c["프로모션"] = g("프로모션") * df["프로모션"].values
     c["광고비"] = g("광고비") * df["광고비"].values
     terms = ["상수", "추세", "요일", "전일매출", "프로모션", "광고비"]
-    c["log예측"] = c[terms].sum(axis=1)
+    # 베이스라인 log예측: PROMO_IN_BASELINE=False면 프로모션 기여 제외(프로모션 컬럼은 표시·원인용 유지)
+    base_terms = [t for t in terms if not (t == "프로모션" and not PROMO_IN_BASELINE)]
+    c["log예측"] = c[base_terms].sum(axis=1)
     c["예측(원)"] = np.exp(c["log예측"])
 
     # 봉우리 비율 = 예측 / 14일 이동중앙값 (국소적으로 얼마나 솟았나)
