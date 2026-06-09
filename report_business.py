@@ -32,13 +32,14 @@ report_business.py
 10_잔차진단         : 정규성·자기상관·등분산·σ
 11_신뢰도_결론      : 규칙기반 자동 진단(경고/주의/양호)
 12_매출_보조요약    : 매출 이상일 + 수량↔매출 비교(단가/할인 이슈 식별)
+13_요일별_광고비    : 요일별 평균 광고비 vs 수량 요일배수(왜 광고비 계수≈0인지 시각 근거)
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from openpyxl.chart import AreaChart, LineChart, Reference
+from openpyxl.chart import AreaChart, BarChart, LineChart, Reference
 from openpyxl.chart.marker import Marker
 from openpyxl.chart.shapes import GraphicalProperties
 from openpyxl.chart.text import RichText
@@ -435,6 +436,51 @@ def _revenue_appendix(result: dict, metric: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 요일별 광고비 vs 수요(왜 광고비 계수≈0인지 시각 근거)
+# ─────────────────────────────────────────────────────────────────────────
+def _weekday_adspend(P: dict, metric: str) -> pd.DataFrame:
+    """요일별 평균 광고비 vs 그 요일의 수요(metric 요일배수)를 한 표로 비교.
+
+    핵심 논지: 광고비는 요일에 거의 평탄(월~일 격차 작음)한데 metric은 요일 따라
+    크게 출렁인다. 회귀에서 요일 더미가 그 변동을 거의 다 흡수하므로, 추세·요일을
+    통제하고 나면 광고비의 한계 설명력(부분효과)이 작아 계수가 0에 수렴한다.
+    (광고비 효과 '완전 부재'의 증명은 아님 — 09 시트 차분회귀의 단기 동행 참고.)
+    """
+    an = _relabel_metric(P["anomalies"], metric)
+    g = an.groupby("요일명")["광고비"].agg(["size", "mean"]).reindex(E.WEEKDAY_KR)
+    p = P["ols"].params
+    base_ad = float(g.loc["월", "mean"]) if not pd.isna(g.loc["월", "mean"]) else np.nan
+    rows = []
+    for wd in E.WEEKDAY_KR:
+        n = int(g.loc[wd, "size"]) if not pd.isna(g.loc[wd, "size"]) else 0
+        ad = float(g.loc[wd, "mean"]) if not pd.isna(g.loc[wd, "mean"]) else np.nan
+        coef = 0.0 if wd == "월" else float(p.get(f"요일_{wd}", 0.0))
+        mult = float(np.exp(coef))
+        rows.append({
+            "요일": wd,
+            "일수": n,
+            "평균광고비": round(ad, 0) if np.isfinite(ad) else np.nan,
+            "광고비지수(월=100)": round(ad / base_ad * 100, 1)
+                if (base_ad and np.isfinite(ad)) else np.nan,
+            f"{metric}_요일배수(EXP)": round(mult, 3),
+            f"{metric}지수(월=100)": round(mult * 100, 1),
+        })
+    out = pd.DataFrame(rows)
+    ad_idx = out["광고비지수(월=100)"].dropna()
+    q_idx = out[f"{metric}지수(월=100)"].dropna()
+    ad_spread = round(float(ad_idx.max() - ad_idx.min()), 1) if len(ad_idx) else np.nan
+    q_spread = round(float(q_idx.max() - q_idx.min()), 1) if len(q_idx) else np.nan
+    out.attrs["note"] = (
+        f"두 지수 모두 월요일=100 기준. 광고비지수 격차(최대-최소)={ad_spread}p, "
+        f"{metric}지수 격차={q_spread}p. 광고비는 요일에 거의 평탄한데 {metric}은 요일 따라 "
+        f"크게 변동 → 회귀의 요일 더미가 그 변동을 흡수하고, 추세(t)·요일 통제 후 광고비의 "
+        f"한계 설명력이 작아 계수가 0에 수렴(02 시트 광고비 계수·08 VIF 참고). "
+        f"단 이는 '구조적(레벨) 효과 미확인'이지 '효과 완전 부재'의 증명은 아님 — "
+        f"09 시트 차분회귀의 당일 양(+)·전일 비유의 결과로 '약한 단기 동행, 인과 미확정'으로 해석.")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 메인
 # ─────────────────────────────────────────────────────────────────────────
 def build_business_report(result: dict, out_path: str, primary: str = "수량") -> str:
@@ -562,6 +608,27 @@ def build_business_report(result: dict, out_path: str, primary: str = "수량") 
         rev_appendix = _revenue_appendix(result, metric)
         rev_appendix.to_excel(xw, sheet_name="12_매출_보조요약", index=False)
 
+        # 13 요일별 광고비 vs 수요 (광고비 계수≈0의 시각 근거)
+        wd_ad = _weekday_adspend(P, metric)
+        wd_ad.to_excel(xw, sheet_name="13_요일별_광고비", index=False)
+        ws13 = xw.sheets["13_요일별_광고비"]
+        nrow = len(wd_ad) + 1                       # 헤더 포함 마지막 행
+        bar = BarChart()
+        bar.type, bar.grouping = "col", "clustered"
+        # 4열=광고비지수, 6열=metric지수 (둘 다 월=100 정규화 → 한 축 비교)
+        bar.add_data(Reference(ws13, min_col=4, max_col=4, min_row=1, max_row=nrow),
+                     titles_from_data=True)
+        bar.add_data(Reference(ws13, min_col=6, max_col=6, min_row=1, max_row=nrow),
+                     titles_from_data=True)
+        bar.set_categories(Reference(ws13, min_col=1, min_row=2, max_row=nrow))
+        bar.title = f"요일별: 광고비지수 vs {metric}지수 (월=100). 광고비는 평탄, {metric}은 출렁"
+        bar.y_axis.title = "지수(월=100)"
+        bar.x_axis.title = "요일"
+        bar.y_axis.delete = False
+        bar.x_axis.delete = False
+        bar.height, bar.width = 9.5, 22
+        ws13.add_chart(bar, "H2")
+
         # 시트별 노트
         for sht, df_ in [("04_이상일_요약", anom_summary),
                          ("06_일별_예측분해", pred_decomp),
@@ -569,7 +636,8 @@ def build_business_report(result: dict, out_path: str, primary: str = "수량") 
                          ("08_다중공선성_VIF", vif),
                          ("10_잔차진단", resid_diag),
                          ("11_신뢰도_결론", conclusions),
-                         ("12_매출_보조요약", rev_appendix)]:
+                         ("12_매출_보조요약", rev_appendix),
+                         ("13_요일별_광고비", wd_ad)]:
             note = df_.attrs.get("note", "")
             if note:
                 ws = xw.sheets[sht]
@@ -585,7 +653,8 @@ def build_business_report(result: dict, out_path: str, primary: str = "수량") 
                           ("07_시그마민감도", sigma_sens.shape[1]),
                           ("08_다중공선성_VIF", vif.shape[1]),
                           ("11_신뢰도_결론", conclusions.shape[1]),
-                          ("12_매출_보조요약", rev_appendix.shape[1])]:
+                          ("12_매출_보조요약", rev_appendix.shape[1]),
+                          ("13_요일별_광고비", wd_ad.shape[1])]:
             if sht in xw.sheets and ncol > 0:
                 _style_header(xw.sheets[sht], ncol)
 
