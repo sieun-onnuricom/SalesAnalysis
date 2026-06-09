@@ -28,8 +28,8 @@ import sales_anomaly_engine as E
 import report_business as RB
 
 
-st.set_page_config(page_title="매출 이상치 탐지", layout="wide")
-st.title("매출 예측 · 이상치 탐지 엔진")
+st.set_page_config(page_title="수량 이상치 탐지", layout="wide")
+st.title("수량 예측·이상치 탐지 엔진")
 st.caption(f"대상: {E.TARGET_BRAND} {E.TARGET_PRODUCT_DAILY}  ·  "
            "베이스라인 OLS(추세+요일+프로모션+광고비) · 예측 ±Kσ 관리한계")
 
