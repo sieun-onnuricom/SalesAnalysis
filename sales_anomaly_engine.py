@@ -2,7 +2,7 @@
 """
 sales_anomaly_engine.py
 =======================
-매출 예측 -> 예측구간(±2σ) 이탈일(이상치) 탐지 -> 이상일 마케팅 활동 매핑 엔진.
+매출 예측 -> 예측구간(±Kσ) 이탈일(이상치) 탐지 -> 이상일 마케팅 활동 매핑 엔진.
 
 설계 원칙
 ---------
@@ -10,7 +10,7 @@ sales_anomaly_engine.py
 - 헤드리스 단독 실행 가능. 다중시트 엑셀 리포트 산출.
 - 베이스라인: 단일 OLS (추세 + 요일 더미 + 프로모션 더미 + 광고비).
   * 평균 재합산 안 함. 추세선 절편에 레벨 포함(이중계산 방지).
-- 이상치 기준: 예측 ±SIGMA_K·σ 관리한계 (SIGMA_K=2.0). σ는 OLS 잔차 표준편차.
+- 이상치 기준: 예측 ±SIGMA_K·σ 관리한계 (SIGMA_K 기본 2.0, 실행 시 sigma_k로 동적 지정). σ는 OLS 잔차 표준편차.
 - 프로모션: 이상치 처리 X -> 회귀 더미로 투입(계획된 이벤트). 광고비(연속)와 별개 축.
 - LightGBM+SHAP: 매체 기여도 레이어 '선택 모듈'. 미설치 시 자동 비활성.
 - 분석 대상: 란시노 유리젖병. SKU 단위까지 분해.
@@ -27,8 +27,8 @@ sales_anomaly_engine.py
                     U,Y,AC(채널 판매수량) G(ROAS) AE(오가닉판매수량, 데이터스튜디오용)
 
 조인키 = (날짜, 브랜드, 제품). 대상 분석은 브랜드=란시노, 제품=유리젖병 고정.
-유리젖병 매칭(매출_raw 제품열): '젖병' 포함 AND 'PP' 미포함.
-  -> 의심 매칭건(부속/세정류 추정)은 별도 리스팅.
+유리젖병 매칭(매출_raw D열 SKU): SKU 코드가 LB160 또는 LB240(접두 일치)이면 유리젖병 본품.
+  -> 제품명 문자열 추정을 쓰지 않고 SKU로 확정. (분류 대상 SKU는 GLASS_BOTTLE_SKUS에서 관리)
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import statsmodels.api as sm
 # ============================================================================
 # 설정
 # ============================================================================
-SIGMA_K = 2.0          # 관리한계 배수 (±2σ)
+SIGMA_K = 2.0          # 관리한계 배수 기본값(±Kσ). 실행 시 run_analysis(sigma_k=)로 override(app 기본 1.5)
 MIN_DAYS_FIT = 30      # OLS 적합 최소 일수
 MIN_DAYS_CV = 60       # 교차검증 최소 일수
 
@@ -60,25 +60,22 @@ USE_CROSS_PROMO_ADSPEND = False     # 광고비×프로모션 교차항
 ENABLE_SHAP = False                 # LightGBM+SHAP 매체 기여도 레이어
 
 # 자기상관/이분산 보정 (잔차진단 결과 반영)
-# ※ lag1 제거 요청 반영: USE_LAG1=False. 단점은 자기상관(DW) 재발 가능 -> 11_잔차진단 재확인 필요.
+# ※ lag1 제거 요청 반영: USE_LAG1=False. 단점은 자기상관(DW) 재발 가능 -> 잔차진단 시트 재확인 필요.
 #   대신 광고비-전일매출 다중공선성이 사라져 광고비 계수 해석이 깨끗해짐(21_VIF 참고).
 USE_LAG1 = False           # 전일 매출(lag-1) 항. False=제거
 USE_LOG_TARGET = True      # 로그매출로 적합 -> 이분산 완화(관리폭이 매출수준에 비례)
 HAC_MAXLAGS = 7            # Newey-West(HAC) 강건 표준오차 lag(주간). 계수 p값 보정용
 SPIKE_PCT = 30.0           # 예측이 전일 대비 ±이 %p 이상 튄 날을 '예측 급변일'로 진단
-USE_WEEKDAY_SIGMA = True   # ±2σ 관리한계를 요일별 σ로 (요일별 변동성 차이 반영 -> 과검출 교정)
+USE_WEEKDAY_SIGMA = True   # ±Kσ 관리한계를 요일별 σ로 (요일별 변동성 차이 반영 -> 과검출 교정)
 WEEKDAY_SIGMA_MIN_N = 10   # 요일별 σ 산출 최소 표본(미만이면 전체 σ 대체)
 
-# 매출_raw 유리젖병 매칭 시 '의심'으로 분류할 부속/비매출 키워드(검토 표시용, 제외 아님)
-ACCESSORY_KEYWORDS = ["젖꼭지", "꼭지", "세정", "세척", "소독", "솔", "브러시",
-                      "케이스", "커버", "거치", "건조", "보관", "리필", "패드"]
+# 유리젖병으로 분류할 SKU 코드(매출_raw D열). 접두 일치(LB160-1P, LB160_2P 등 변형 포함).
+# 제품명 문자열 추정 대신 이 목록으로 '확정'. 품목 추가 시 코드만 넣으면 됨.
+GLASS_BOTTLE_SKUS = ["LB160", "LB240"]
 
-# 수기 검토 후 유리젖병에서 '제외'할 제품명(완전일치). 규칙으로 못 거르는 혼합박스 등.
-# (내추럴웨이브 젖꼭지/뚜껑류는 _is_glass_bottle 규칙이 자동 제외하므로 여기 둘 필요 없음)
-EXCLUDE_PRODUCTS: list[str] = [
-    "[임신출산선물] 란시노 베스트셀러 박스 A(젖병, 젖꼭지, 수유패드 포함 + 파우치 증정)",
-    "[임신출산선물] 란시노 베스트셀러 박스 B(젖병, 젖꼭지, 수유패드 포함 + 파우치 증정)",
-]
+# (참고) SKU로 확정하므로 제품명 키워드/혼합박스 수기제외 로직은 불필요.
+#  혹시 특정 SKU를 강제 제외해야 하면 EXCLUDE_SKUS에 코드(접두)를 넣는다.
+EXCLUDE_SKUS: list[str] = []
 
 # 프로모션 일정 (행사명, 시작, 종료) — 종료일 포함
 PROMO_SCHEDULE = [
@@ -186,63 +183,47 @@ def load_daily_data(path: str, sheet_name=0, diag: JoinDiagnostics | None = None
 # ============================================================================
 # 2. 대상 필터 + 유리젖병 매칭 진단
 # ============================================================================
-def _is_glass_bottle(name: str) -> bool:
-    """유리젖병 본품 판정.
-    - 확정: '유리젖병'/'유리 젖병' 과 용량(ml)이 함께 있으면 본품(사용자 규칙).
-    - 제외: 위 확정 신호가 없으면서 젖꼭지/뚜껑류(내추럴웨이브 등)면 부속.
-    - 그 외: 기존 규칙('젖병' 포함 & 'PP' 미포함).
-    """
-    s = str(name)
-    if "PP" in s.upper():
-        return False
-    is_glass = ("유리젖병" in s) or ("유리 젖병" in s)
-    has_ml = bool(re.search(r"\d+\s*ml", s, re.IGNORECASE))
-    if is_glass and has_ml:                 # 유리젖병 + ml -> 본품 확정
-        return True
-    non_body = ["내추럴웨이브", "내추럴 웨이브", "젖병꼭지", "뚜껑", "캡", "보관"]
-    if any(k in s for k in non_body) and not is_glass:
-        return False
-    return "젖병" in s
+def _norm_sku(sku) -> str:
+    """SKU 정규화: 문자열화·공백제거·대문자."""
+    return str(sku).strip().upper().replace(" ", "")
 
 
-def _is_suspect(name: str) -> bool:
-    """검토용 '의심' 라벨. 단, 유리젖병+ml로 본품이 확정된 것은 의심에서 제외."""
-    s = str(name)
-    is_glass = ("유리젖병" in s) or ("유리 젖병" in s)
-    has_ml = bool(re.search(r"\d+\s*ml", s, re.IGNORECASE))
-    if is_glass and has_ml:                 # 본품 확정 -> 의심 아님
+def _is_glass_bottle_sku(sku) -> bool:
+    """유리젖병 본품 판정 = SKU 코드가 GLASS_BOTTLE_SKUS 중 하나로 시작.
+    제품명 문자열을 추정하지 않고 D열 SKU로 '확정'한다(LB160-1P, LB160_2P 등 변형 포함)."""
+    s = _norm_sku(sku)
+    if not s:
         return False
-    return any(kw in s for kw in ACCESSORY_KEYWORDS)
+    if EXCLUDE_SKUS and any(s.startswith(_norm_sku(x)) for x in EXCLUDE_SKUS):
+        return False
+    return any(s.startswith(_norm_sku(code)) for code in GLASS_BOTTLE_SKUS)
 
 
 def filter_target_raw(df_raw: pd.DataFrame, diag: JoinDiagnostics) -> pd.DataFrame:
-    """매출_raw에서 란시노 유리젖병 거래 추출 + 매칭 진단."""
+    """매출_raw에서 란시노 유리젖병 거래 추출(D열 SKU 기준) + 매칭 진단."""
     diag.n_raw_rows_total = len(df_raw)
     brand_mask = df_raw["브랜드"] == TARGET_BRAND
     sub = df_raw[brand_mask].copy()
-    sub["_is_glass"] = sub["제품"].map(_is_glass_bottle)
+    sub["_is_glass"] = sub["SKU"].map(_is_glass_bottle_sku)   # 제품명 X, SKU로 확정
     matched = sub[sub["_is_glass"]].copy()
-
-    # 수기 확정 제외 적용
-    if EXCLUDE_PRODUCTS:
-        before = len(matched)
-        matched = matched[~matched["제품"].isin(EXCLUDE_PRODUCTS)]
-        diag.log(f"EXCLUDE_PRODUCTS 적용: {before - len(matched)}행 제외 "
-                 f"({len(EXCLUDE_PRODUCTS)}종 지정)")
     diag.n_raw_rows_matched = len(matched)
 
-    distinct = sorted(matched["제품"].unique().tolist())
-    diag.raw_matched_products = distinct
-    diag.raw_suspect_products = [p for p in distinct if _is_suspect(p)]
+    # 매칭된 SKU 코드 / 그 SKU에 붙은 제품명(검증용)
+    distinct_sku = sorted(matched["SKU"].astype(str).str.strip().unique().tolist())
+    distinct_name = sorted(matched["제품"].astype(str).str.strip().unique().tolist())
+    diag.raw_matched_products = distinct_name
+    # 사용한 SKU인데 제품명에 '젖병'이 없으면 확인 권장(분류엔 영향 없음, 점검 보조)
+    diag.raw_suspect_products = [n for n in distinct_name if "젖병" not in n]
 
     diag.log(f"매출_raw 총 {diag.n_raw_rows_total}행 중 란시노 {int(brand_mask.sum())}행, "
-             f"유리젖병 매칭 {diag.n_raw_rows_matched}행 / distinct 제품 {len(distinct)}종")
-    diag.log(f"매칭 제품명: {distinct}")
+             f"유리젖병(SKU={GLASS_BOTTLE_SKUS}) 매칭 {diag.n_raw_rows_matched}행")
+    diag.log(f"매칭 SKU: {distinct_sku}")
+    diag.log(f"매칭 제품명: {distinct_name}")
     if diag.raw_suspect_products:
-        diag.log(f"[의심 매칭] 부속/비매출 추정 {len(diag.raw_suspect_products)}종 "
-                 f"-> 수기 확인 권장: {diag.raw_suspect_products}")
+        diag.log(f"[확인 권장] 매칭 SKU인데 제품명에 '젖병' 없음 {len(diag.raw_suspect_products)}종 "
+                 f"-> SKU 매핑 점검: {diag.raw_suspect_products}")
     else:
-        diag.log("의심 매칭 없음.")
+        diag.log("매칭 SKU의 제품명 정합성 양호.")
     return matched.drop(columns=["_is_glass"])
 
 
@@ -510,8 +491,8 @@ def detect_anomalies(res, sigma: float, df: pd.DataFrame, sigma_map: dict = None
 
 
 def residual_diagnostics(res, sigma: float) -> pd.DataFrame:
-    """±2σ 가정의 통계적 정당성 검증: 잔차 정규성·자기상관·등분산.
-    R²가 낮아도 이 검정이 양호하면 ±2σ 판정은 정당함.
+    """±Kσ 가정의 통계적 정당성 검증: 잔차 정규성·자기상관·등분산.
+    R²가 낮아도 이 검정이 양호하면 ±Kσ 판정은 정당함.
     """
     resid = np.asarray(res.resid, dtype=float)
     rows = []
@@ -521,7 +502,7 @@ def residual_diagnostics(res, sigma: float) -> pd.DataFrame:
         from statsmodels.stats.stattools import jarque_bera
         jb, jb_p, skew, kurt = jarque_bera(resid)
         rows.append(("잔차 정규성 (Jarque-Bera p)", round(float(jb_p), 4),
-                     "p>0.05면 정규에 가까움(±2σ 의미 성립)"))
+                     "p>0.05면 정규에 가까움(±Kσ 의미 성립)"))
         rows.append(("  - 왜도(skew)", round(float(skew), 3), "0에 가까울수록 대칭"))
         rows.append(("  - 첨도(kurtosis)", round(float(kurt), 3), "3에 가까울수록 정규"))
     except Exception as e:
@@ -555,7 +536,7 @@ def residual_diagnostics(res, sigma: float) -> pd.DataFrame:
     except Exception as e:
         rows.append(("Breusch-Pagan", "계산불가", str(e)[:40]))
 
-    rows.append(("σ (잔차표준편차)", round(sigma, 1), "±2σ 관리한계의 폭 근거"))
+    rows.append(("σ (잔차표준편차)", round(sigma, 1), "±Kσ 관리한계의 폭 근거"))
     return pd.DataFrame(rows, columns=["검정", "값", "해석"])
 
 
@@ -589,7 +570,7 @@ def sigma_sensitivity(res, sigma: float, df: pd.DataFrame, sigma_map: dict = Non
     out = pd.DataFrame(rows)
     out.attrs["note"] = ("관리한계 배수 K가 낮을수록 이상일을 더 많이 잡음(밴드 좁힘). "
                          "실제비율이 정규기대와 가까우면 ±Kσ 기준이 데이터에 부합. "
-                         "정규기대=2·(1−Φ(K))·100, 잔차 정규가정 기준이라 실제와 다를 수 있음(11_잔차진단 참고).")
+                         "정규기대=2·(1−Φ(K))·100, 잔차 정규가정 기준이라 실제와 다를 수 있음(잔차진단 시트 참고).")
     return out
 
 
@@ -993,7 +974,7 @@ def analysis_method_definitions() -> pd.DataFrame:
          "설계행렬 각 변수",
          ">5 주의, >10 심각. 계수 불안정(공선성) 여부."),
         ("이상치 판정", "OLS 예측 ±K·σ 관리한계",
-         "이상 = |실측−예측| > K·σ (K=2). 로그모델이라 원단위는 예측×exp(±Kσ)",
+         "이상 = |실측−예측| > K·σ (K=SIGMA_K). 로그모델이라 원단위는 예측×exp(±Kσ)",
          "요일별 σ 적용",
          "예측구간 이탈일. σ는 요일별 잔차 표준편차."),
     ]
@@ -1363,7 +1344,11 @@ def _make_synthetic(sales_path: str, daily_path: str, seed: int = 7):
     """실제 시트 레이아웃(매출_raw 1행 / 일간데이터 2행 헤더)대로 합성 파일 생성."""
     rng = np.random.default_rng(seed)
     dates = pd.date_range("2025-01-01", "2026-03-31", freq="D")
-    skus = ["유리젖병160_2P", "유리젖병240_2P", "유리젖병160_1P"]
+    # 실제 SKU 코드 체계로(유리젖병=LB160/LB240, 팩 변형 접미 포함). 제품명은 검증용 부가.
+    skus = ["LB160-1P", "LB160-2P", "LB240-2P"]
+    name_map = {"LB160-1P": "란시노 유리젖병160 1P 역류방지 젖병",
+                "LB160-2P": "란시노 유리젖병160 2P 역류방지 젖병",
+                "LB240-2P": "란시노 유리젖병240 2P 역류방지 젖병"}
     promo = set()
     for _, s, e in PROMO_SCHEDULE:
         for d in pd.date_range(s, e):
@@ -1382,9 +1367,11 @@ def _make_synthetic(sales_path: str, daily_path: str, seed: int = 7):
             sku = rng.choice(skus)
             qty = int(rng.integers(1, 4))
             amt = max(0, (base / n_tx) * rng.uniform(0.7, 1.3))
-            rows.append(["란시노", "란시노 " + sku.replace("_", " ") + " 역류방지 젖병",
+            rows.append(["란시노", name_map[sku],
                          sku, d, 19900, 9000, round(amt), qty, "acct_a"])
-        # 노이즈: 다른 브랜드/제품
+        # 노이즈: 비대상 SKU(란시노지만 유리젖병 아님) + 타브랜드
+        rows.append(["란시노", "란시노 젖꼭지 2P", "LN-NIP", d, 9900, 3000,
+                     round(rng.uniform(5000, 30000)), 1, "acct_a"])
         rows.append(["기타브랜드", "기타 PP젖병 세트", "PP_X", d, 9900, 4000,
                      round(rng.uniform(10000, 50000)), 1, "acct_b"])
     raw = pd.DataFrame(rows, columns=["브랜드", "제품", "SKU", "결제일자",
