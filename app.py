@@ -141,7 +141,7 @@ else:
 st.divider()
 st.markdown(
     "<div style='text-align:center; color:#888; font-size:0.85rem; padding:6px 0;'>"
-    "매출 분석 모델 · 박시은 · 2026-06-08"
+    "매출 분석 모델 · 박시은 · 2026-06-09"
     "</div>",
     unsafe_allow_html=True,
 )
